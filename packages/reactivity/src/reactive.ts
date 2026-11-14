@@ -1,3 +1,22 @@
+// ============================================================================
+// reactive.ts：代理工厂与四种“响应式风味”
+// ============================================================================
+// 本文件只做两件事：
+//   1. 决定一个值要不要被 Proxy 包、包成哪一种（可写/只读 × 深/浅）；
+//   2. 缓存代理，保证“同一个原始对象 + 同一种风味”只创建一个 Proxy。
+//
+// 四种风味与各自的缓存表：
+//   reactive        → reactiveMap           可写、深、递归包装嵌套对象
+//   shallowReactive → shallowReactiveMap    可写、浅、只代理第一层
+//   readonly        → readonlyMap           只读、深、读到的对象继续 readonly
+//   shallowReadonly → shallowReadonlyMap    只读、浅
+// 缓存必须按风味分开：同一个原始对象可以同时有可写代理和只读代理，两者不是一回事。
+//
+// 深转换是惰性的：这里只包装传入的这一层，嵌套对象要等到 get 时由
+// baseHandlers 再调 reactive()/readonly()，所以没被读到的子树不产生代理。
+// 这与 MobX 的 observable 深转换不同——MobX 在定义时就把整棵树转成 observable。
+// ============================================================================
+
 import { def, hasOwn, isObject, toRawType } from '@vue/shared'
 import {
   mutableHandlers,
@@ -24,6 +43,8 @@ export interface Target {
 }
 
 export const reactiveMap: WeakMap<Target, any> = new WeakMap<Target, any>()
+// 四张表都是 WeakMap：原始对象被回收后，对应的代理缓存自动消失。键是原始对象
+// （不是 Proxy），所以代理自身的 ReactiveFlags.RAW 才能指回它。
 export const shallowReactiveMap: WeakMap<Target, any> = new WeakMap<
   Target,
   any
@@ -40,6 +61,11 @@ enum TargetType {
   COLLECTION = 2,
 }
 
+// 只按“原始类型标签”分三档，不做鸭子类型判断：
+//   Object/Array          → 走 baseHandlers（get/set/has/ownKeys 全套陷阱）
+//   Map/Set/WeakMap/WeakSet → 走 collectionHandlers（只拦 get，返回改写后的方法）
+//   其他（Date/RegExp/类实例等）→ 不代理，原样返回
+// 这个分档是后面 createReactiveObject 拒绝代理的唯一依据。
 function targetTypeMap(rawType: string) {
   switch (rawType) {
     case 'Object':
@@ -86,6 +112,7 @@ export function reactive<T extends object>(target: T): Reactive<T>
 /*@__NO_SIDE_EFFECTS__*/
 export function reactive(target: object) {
   // if trying to observe a readonly proxy, return the readonly version.
+  // 只读代理上再套可写代理会产生“能写但写不进去”的怪对象，直接原样返回。
   if (isReadonly(target)) {
     return target
   }
@@ -143,6 +170,8 @@ export type ShallowReactive<T> = T & ShallowReactiveBrand
 export function shallowReactive<T extends object>(
   target: T,
 ): ShallowReactive<T> {
+  // 与 reactive 的唯一差别是 handler 与缓存表；仍然允许多层代理叠加（浅代理的
+  // 属性值若本身是代理，读出来还是那个代理）。
   return createReactiveObject(
     target,
     false,
@@ -209,6 +238,8 @@ export type DeepReadonly<T> = T extends Builtin
 export function readonly<T extends object>(
   target: T,
 ): DeepReadonly<UnwrapNestedRefs<T>> {
+  // 只读代理没有任何写入路径（handler 的 set/delete 只警告不落盘），但读仍然
+  // 会 track：只读视图本身也可以作为依赖来源，源对象变化时订阅者照样重跑。
   return createReactiveObject(
     target,
     true,
@@ -266,6 +297,8 @@ function createReactiveObject(
   collectionHandlers: ProxyHandler<any>,
   proxyMap: WeakMap<Target, any>,
 ) {
+  // 下面五个 if 的顺序就是“拦截优先级”，每一条都会原样返回而不抛错：
+  // 1) 非对象（含 null）：Proxy 只能包对象；
   if (!isObject(target)) {
     if (__DEV__) {
       warn(
@@ -278,6 +311,8 @@ function createReactiveObject(
   }
   // target is already a Proxy, return it.
   // exception: calling readonly() on a reactive object
+  // 2) 已经是本库的代理：直接复用。唯一的例外是 readonly(reactiveObj)——
+  //    需要一个只读视图，不能返回原可写代理。
   if (
     target[ReactiveFlags.RAW] &&
     !(isReadonly && target[ReactiveFlags.IS_REACTIVE])
@@ -285,18 +320,24 @@ function createReactiveObject(
     return target
   }
   // only specific value types can be observed.
+  // 3) markRaw 标记过，或对象被冻结/不可扩展：不代理（Proxy 写入会失败，且
+  //    Object.freeze 的对象本就不该被观察）。
   if (target[ReactiveFlags.SKIP] || !Object.isExtensible(target)) {
     return target
   }
   // target already has corresponding Proxy
+  // 4) 同一风味已有缓存：复用，保证 identity 稳定（a === reactive(raw)）。
   const existingProxy = proxyMap.get(target)
   if (existingProxy) {
     return existingProxy
   }
+  // 5) 类型不在白名单内：不代理。
   const targetType = targetTypeMap(toRawType(target))
   if (targetType === TargetType.INVALID) {
     return target
   }
+  // 集合与普通对象需要完全不同的陷阱集，所以在这里二选一；创建后立刻入缓存，
+  // 避免递归包装同一对象时无限创建。
   const proxy = new Proxy(
     target,
     targetType === TargetType.COLLECTION ? collectionHandlers : baseHandlers,
@@ -325,6 +366,8 @@ function createReactiveObject(
  */
 /*@__NO_SIDE_EFFECTS__*/
 export function isReactive(value: unknown): boolean {
+  // 只读代理自身没有 IS_REACTIVE，但它底层可能是 reactive：先剥一层 RAW 再问。
+  // 因此 readonly(reactive(obj)) 对 isReactive 回答 true，而 readonly(obj) 回答 false。
   if (isReadonly(value)) {
     return isReactive((value as Target)[ReactiveFlags.RAW])
   }
@@ -361,6 +404,8 @@ export function isShallow(value: unknown): boolean {
  */
 /*@__NO_SIDE_EFFECTS__*/
 export function isProxy(value: any): boolean {
+  // 比 isReactive/isReadonly 更宽：只要有 RAW 标记就是（可写或只读）代理。
+  // ref 不是 Proxy，所以 isProxy(ref(1)) 为 false。
   return value ? !!value[ReactiveFlags.RAW] : false
 }
 
@@ -389,6 +434,8 @@ export function isProxy(value: any): boolean {
  */
 /*@__NO_SIDE_EFFECTS__*/
 export function toRaw<T>(observed: T): T {
+  // 递归剥：readonly(reactive(raw)) 有两层，一次 RAW 只回到内层代理。
+  // 这是“绕过代理、直接读原始值”的逃生口，也因此不会触发 track。
   const raw = observed && (observed as Target)[ReactiveFlags.RAW]
   return raw ? toRaw(raw) : observed
 }
@@ -418,6 +465,8 @@ export type Raw<T> = T & { [RawSymbol]?: true }
  * @see {@link https://vuejs.org/api/reactivity-advanced.html#markraw}
  */
 export function markRaw<T extends object>(value: T): Raw<T> {
+  // 标记写成一个不可枚举的自有属性，createReactiveObject 第一道检查就会放行。
+  // 为什么还要求 isExtensible：不可扩展对象加不了属性，标了也没用。
   if (!hasOwn(value, ReactiveFlags.SKIP) && Object.isExtensible(value)) {
     def(value, ReactiveFlags.SKIP, true)
   }
@@ -432,6 +481,8 @@ export function markRaw<T extends object>(value: T): Raw<T> {
  * @param value - The value for which a reactive proxy shall be created.
  */
 export const toReactive = <T extends unknown>(value: T): T =>
+  // 被 baseHandlers/ref/collectionHandlers 用来做“读时深转换”：只有对象才包装，
+  // 原始值原样返回。惰性代理的落点就在这一行。
   isObject(value) ? reactive(value) : value
 
 /**

@@ -1,3 +1,25 @@
+// ============================================================================
+// computed.ts：惰性求值 + 脏标记
+// ============================================================================
+// computed 同时扮演两个角色：
+//   1. Subscriber —— 它订阅 getter 里读到的属性（deps/depsTail/flags）；
+//   2. 依赖源    —— 它自己持有一个 Dep（dep），下游读 .value 时订阅的是它。
+// 所以它既是“边”的一端，也是另一个“点”。
+//
+// 惰性链条（读 .value 时）：
+//   Dep.track() 记下“下游依赖 computed”
+//   → refreshComputed() 判断要不要重算
+//   → 重算时 activeSub 换成 computed 自己，getter 里的读记到它的 deps 上
+//   → 值真变了才 dep.version++，从而让下游 isDirty 成立
+// 触发链条（上游变化时）：
+//   Dep.notify() 调 computed.notify() → 只置 DIRTY + 把自己排进 computed 批
+//   → endBatch 只清 NOTIFIED 不执行
+//   → 真正的重算推迟到下一次 .value 读取
+//
+// 这就是“computed 没人读就不会算”的全部机制；DIRTY 是唯一的“可能过期”标记，
+// 真正的过期判断在 refreshComputed 里用版本号比较完成。
+// ============================================================================
+
 import { isFunction } from '@vue/shared'
 import {
   type DebuggerEvent,
@@ -52,6 +74,8 @@ export class ComputedRefImpl<T = any> implements Subscriber {
   /**
    * @internal
    */
+  // 对外暴露的依赖源。下游 effect 读 .value 时订阅的就是它，而不是 getter 里
+  // 那些原始属性——这正是 computed 能把“多个上游变化”折叠成“一次下游执行”的原因。
   readonly dep: Dep = new Dep(this)
   /**
    * @internal
@@ -79,10 +103,13 @@ export class ComputedRefImpl<T = any> implements Subscriber {
   /**
    * @internal
    */
+  // 初值 globalVersion - 1：保证第一次读一定不会命中“世界没变”的快路径。
   globalVersion: number = globalVersion - 1
   /**
    * @internal
    */
+  // SSR 下没有渲染 effect 作为下游，computed 不会留下 deps，所以 refreshComputed
+  // 不能依赖 isDirty，只能靠 globalVersion 做缓存（详见 effect.ts）。
   isSSR: boolean
   /**
    * @internal
@@ -115,12 +142,17 @@ export class ComputedRefImpl<T = any> implements Subscriber {
    * @internal
    */
   notify(): true | void {
+    // 只标脏 + 入队，不求值：
+    //   DIRTY    —— 下次读 .value 时 refreshComputed 会真正检查；
+    //   NOTIFIED —— 同一批次内避免重复入队；
+    //   activeSub !== this —— 防止 computed 在自己的 getter 里写自己造成递归。
     this.flags |= EffectFlags.DIRTY
     if (
       !(this.flags & EffectFlags.NOTIFIED) &&
       // avoid infinite self recursion
       activeSub !== this
     ) {
+      // 返回 true 告诉 Dep.notify()：“我是 computed，请顺手通知我的下游”。
       batch(this, true)
       return true
     } else if (__DEV__) {
@@ -129,6 +161,9 @@ export class ComputedRefImpl<T = any> implements Subscriber {
   }
 
   get value(): T {
+    // 先 track：下游订阅的是 computed 自己的 dep，而不是它内部的属性。
+    // 顺序很关键——必须在 refreshComputed 之前 track，否则重算过程中 activeSub
+    // 已切换成 computed，下游依赖会记错对象。
     const link = __DEV__
       ? this.dep.track({
           target: this,
@@ -138,6 +173,8 @@ export class ComputedRefImpl<T = any> implements Subscriber {
       : this.dep.track()
     refreshComputed(this)
     // sync version after evaluation
+    // 求值可能让 dep.version 自增；把刚建的 link 版本对齐到最新，避免它自己
+    // 立刻被判成脏（否则读一次就会触发一次多余的重算）。
     if (link) {
       link.version = this.dep.version
     }

@@ -1353,6 +1353,12 @@ function baseCreateRenderer(
     namespace: ElementNamespace,
     optimized,
   ) => {
+    // 【与 reactivity 的衔接点 1】
+    // componentUpdateFn 就是组件渲染 effect 的函数体：首次执行走 mount 分支，
+    // 之后由 scheduler 排队再执行时走 update 分支。它内部对响应式数据的读取
+    // （renderComponentRoot 里调用 render 函数）会被 dep.ts 的 activeSub 记成
+    // 本 effect 的依赖，于是数据变化 → Dep.notify → effect.trigger →
+    // effect.scheduler() → queueJob（见下方 1654 行）。
     const componentUpdateFn = () => {
       if (!instance.isMounted) {
         let vnodeHook: VNodeHook | null | undefined
@@ -1643,18 +1649,31 @@ function baseCreateRenderer(
     }
 
     // create reactive effect for rendering
+    // 【与 reactivity 的衔接点 2】
+    // 在组件 scope 内创建 effect：构造时 ReactiveEffect 会把自己 push 进当前
+    // scope，因此组件卸载 → scope.stop() → effect.stop() → 摘掉所有依赖。
+    // 注意这里只 new、不 run：真正的首次渲染稍后由 setup 之后的 update() 触发。
     instance.scope.on()
     const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
     instance.scope.off()
 
+    // 两个入口，用途不同：
+    //   update —— 直接运行（mount 阶段与 forceUpdate 用）；
+    //   job    —— 交给调度器，runIfDirty 会先做版本脏检查，避免“通知了但其实
+    //             相关依赖没变”的无效重渲染。id = uid 决定父先于子执行，
+    //             i = instance 供错误处理定位组件。
     const update = (instance.update = effect.run.bind(effect))
     const job: SchedulerJob = (instance.job = effect.runIfDirty.bind(effect))
     job.i = instance
     job.id = instance.uid
+    // 这就是 reactivity 侧 scheduler 的落点：Dep.notify → effect.trigger →
+    // this.scheduler() = queueJob(job)。
     effect.scheduler = () => queueJob(job)
 
     // allowRecurse
     // #1801, #2043 component render effects should allow recursive updates
+    // 渲染 effect 必须允许自触发：更新过程中可能再次修改响应式数据（例如
+    // updated 钩子），否则这些修改会被 RUNNING 检查静默丢弃。
     toggleRecurse(instance, true)
 
     if (__DEV__) {

@@ -1,3 +1,20 @@
+// ============================================================================
+// ref.ts：单值容器
+// ============================================================================
+// ref 解决的是“原始值无法被 Proxy 拦截”的问题：Proxy 只能包对象，而 number /
+// string 没有属性可拦。做法是造一个小对象，把值放在 .value 上，读写 .value 时
+// 手动 track / trigger（一个 RefImpl 持有一个 Dep）。
+//
+// 几个容易混的点：
+//   - _rawValue 与 _value 不是同一份：_rawValue 永远存原始值（用于 hasChanged
+//     比较），_value 存“可能被 reactive 包过”的展示值；
+//   - 对象 ref 的深响应不靠 RefImpl 递归，而靠 toReactive(value) 把对象包成
+//     reactive 代理，之后读写走的是 baseHandlers；
+//   - ObjectRefImpl（toRef）不持有 Dep，它的 dep 是从 targetMap 里反查出来的，
+//     因此它的更新依赖源对象本身；
+//   - customRef 把 Dep 的 track/trigger 直接交给用户，是唯一“手动挡”入口。
+// ============================================================================
+
 import {
   type IfAny,
   hasChanged,
@@ -115,18 +132,23 @@ class RefImpl<T = any> {
   _value: T
   private _rawValue: T
 
+  // 每个 ref 自己的依赖源。与 computed 不同，它没有 Subscriber 身份——ref 不
+  // 订阅别人，只被别人订阅。
   dep: Dep = new Dep()
 
   public readonly [ReactiveFlags.IS_REF] = true
   public readonly [ReactiveFlags.IS_SHALLOW]: boolean = false
 
   constructor(value: T, isShallow: boolean) {
+    // 深 ref：_rawValue 存 toRaw(value)（比较用原始值），_value 存 toReactive(value)
+    //（读出来是代理，嵌套属性才响应式）。浅 ref 两者都原样存。
     this._rawValue = isShallow ? value : toRaw(value)
     this._value = isShallow ? value : toReactive(value)
     this[ReactiveFlags.IS_SHALLOW] = isShallow
   }
 
   get value() {
+    // 读 .value 就是一次 track；没有 activeSub 时 Dep.track() 自己会短路。
     if (__DEV__) {
       this.dep.track({
         target: this,
@@ -141,11 +163,14 @@ class RefImpl<T = any> {
 
   set value(newValue) {
     const oldValue = this._rawValue
+    // 与 reactive 的写路径一致：深 ref 要把代理值拆成原始值再比较/存储，
+    // 但浅值/只读值必须原样保留（否则会破坏只读语义与浅引用身份）。
     const useDirectValue =
       this[ReactiveFlags.IS_SHALLOW] ||
       isShallow(newValue) ||
       isReadonly(newValue)
     newValue = useDirectValue ? newValue : toRaw(newValue)
+    // hasChanged 而不是 !==：正确处理 NaN（NaN !== NaN 但应视为未变）。
     if (hasChanged(newValue, oldValue)) {
       this._rawValue = newValue
       this._value = useDirectValue ? newValue : toReactive(newValue)
@@ -191,6 +216,8 @@ class RefImpl<T = any> {
  */
 export function triggerRef(ref: Ref): void {
   // ref may be an instance of ObjectRefImpl
+  // 只对“自带 dep”的 ref 有效：ObjectRefImpl 的 dep 是从响应式源反查的，
+  // 源没变时强行 trigger 会造出一个不存在的版本。
   if ((ref as unknown as RefImpl).dep) {
     if (__DEV__) {
       ;(ref as unknown as RefImpl).dep.trigger({
@@ -251,6 +278,8 @@ export function toValue<T>(source: MaybeRefOrGetter<T>): T {
 }
 
 const shallowUnwrapHandlers: ProxyHandler<any> = {
+  // proxyRefs 只做“一层解包”：读属性时若值是 ref 就取 .value，写属性时若旧值
+  // 是 ref 就写它的 .value。它不递归、不 track——依赖仍由源对象/内层 ref 负责。
   get: (target, key, receiver) =>
     key === ReactiveFlags.RAW
       ? target
@@ -302,6 +331,8 @@ class CustomRefImpl<T, S = T> {
 
   constructor(factory: CustomRefFactory<T, S>) {
     const dep = (this.dep = new Dep())
+    // 把 Dep 的两个原语直接交给用户：get 里调 track() 才算“读依赖”，set 里调
+    // trigger() 才算“通知”。框架不插手，所以防抖/异步这类自定义时机才写得出来。
     const { get, set } = factory(dep.track.bind(dep), dep.trigger.bind(dep))
     this._get = get
     this._set = set
@@ -359,6 +390,9 @@ type ToRefValue<T extends object, K extends ToRefKey<T>> = K extends keyof T
  */
 /*@__NO_SIDE_EFFECTS__*/
 export function toRefs<T extends object>(object: T): ToRefs<T> {
+  // 只接受代理：普通对象上的 toRefs 不会产生响应式连接（DEV 警告）。
+  // 数组用长度预分配，避免 toRefs 产生稀疏数组；每个元素都用 ObjectRefImpl
+  // 惰性指向源下标，不做任何值拷贝。
   if (__DEV__ && !isProxy(object)) {
     warn(`toRefs() expects a reactive object but received a plain one.`)
   }
@@ -389,8 +423,11 @@ class ObjectRefImpl<T extends object, K extends keyof T> {
     let obj = _object
 
     // For an array with integer key, refs are not unwrapped
+    // 数组整数下标的 ref 本来就不自动解包，无需判断。
     if (!isArray(_object) || isSymbol(this._key) || !isIntegerKey(this._key)) {
       // Otherwise, check each proxy layer for unwrapping
+      // 从最外层逐层剥代理：只要遇到“非代理（链尾）”或“浅代理”，说明读到的
+      // 值不会被自动解包，本类要自己 unref；若一路都是深代理，读到时就已解包。
       do {
         shallow = !isProxy(obj) || isShallow(obj)
       } while (shallow && (obj = (obj as Target)[ReactiveFlags.RAW]))
@@ -400,6 +437,8 @@ class ObjectRefImpl<T extends object, K extends keyof T> {
   }
 
   get value() {
+    // 注意这里直接用 _object[key] 读：走的是源对象的 get 陷阱，因此依赖记在
+    // 源属性上，而不是这个 ref 上。这也是 toRef 能和源对象“双向同步”的原因。
     let val = this._object[this._key]
     if (this._shallow) {
       val = unref(val)
@@ -408,6 +447,8 @@ class ObjectRefImpl<T extends object, K extends keyof T> {
   }
 
   set value(newVal) {
+    // 浅链路上属性本身就是 ref 时，写 .value 应写内层 ref 的 .value，而不是
+    // 把整个 ref 替换掉（与 reactive set 里的 ref 处理保持同一语义）。
     if (this._shallow && isRef(this._raw[this._key])) {
       const nestedRef = this._object[this._key]
       if (isRef(nestedRef)) {
@@ -420,6 +461,8 @@ class ObjectRefImpl<T extends object, K extends keyof T> {
   }
 
   get dep(): Dep | undefined {
+    // ObjectRefImpl 没有自己的 Dep：向全局 targetMap 反查源属性的 Dep。
+    // 取不到（源属性从未被读过）就返回 undefined，triggerRef 会因此跳过。
     return getDepFromReactive(this._raw, this._key)
   }
 }

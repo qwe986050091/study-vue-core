@@ -638,6 +638,9 @@ export function createComponentInstance(
     update: null!, // will be set synchronously right after creation
     job: null!,
     scope: new EffectScope(true /* detached */),
+    // 组件 scope 是 detached 的：它不挂到“创建它的父 scope”上，否则父组件
+    // setup 期间创建的子组件 effect 会随父 scope 一起停，时机就错了。组件的
+    // 生命周期由 unmount 显式调用 scope.stop() 控制（renderer.ts）。
     render: null,
     proxy: null,
     exposed: null,
